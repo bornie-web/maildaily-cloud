@@ -53,9 +53,13 @@ URL_RE=re.compile(r'(?:https?://|www\.)[^\s<>"\'））】」]+',re.I)
 TOKEN_RE=re.compile(r'\b[A-Za-z0-9+/_-]{32,}={0,2}')
 CSSID_RE=re.compile(r'\b(?=[\w.+-]*[A-Z])(?=[\w.+-]*[.])[A-Za-z0-9_+-]+(?:\.[A-Za-z0-9_+-]+){2,}\b')
 ZW_RE=re.compile(r'[​‌‍﻿­]')
+# Literal comment residue: some senders escape conditional comments into visible text.
+LITERAL_COMMENT_RE=re.compile(r'<!--\[if[^\]]*\]>\s*<!-->|<!--<!\[endif\]-->|<!\[endif\]-->|<!--[\s\S]{0,200}?-->|<!--|-->')
 def clean_text(value):
     """Remove markup residue, tracking URLs and machine tokens from extracted text."""
     value=html.unescape(value)
+    value=LITERAL_COMMENT_RE.sub(' ',value)
+    value=re.sub(r'<\s*>','',value)
     value=ZW_RE.sub('',value)
     value=URL_RE.sub(' ',value)
     value=TOKEN_RE.sub(' ',value)
