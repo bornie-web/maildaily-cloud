@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from core import Store, digest_query, organize
+from translation import translate_digest
 load_dotenv()
 log=logging.getLogger('maildaily')
 SCOPES='https://www.googleapis.com/auth/gmail.readonly'
@@ -129,11 +130,23 @@ def create_app(settings=None, start_scheduler=True):
     @app.get('/v1/state',dependencies=[Depends(auth)])
     async def state():
         g=store.get('google',{})
-        return {'connected':bool(g),'account':g.get('email'),'schedule':store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True}),'lastError':store.get('last_error'),'pushRegistered':bool(store.get('push')),'pushStatus':store.get('push_status','not_configured'),'summaryMode':'规则归类与正文摘录'}
+        return {'connected':bool(g),'account':g.get('email'),'schedule':store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True}),'lastError':store.get('last_error'),'pushRegistered':bool(store.get('push')),'pushStatus':store.get('push_status','not_configured'),'translationAvailable':bool(os.getenv('GOOGLE_TRANSLATE_API_KEY','').strip()),'summaryMode':'规则归类与正文摘录'}
     @app.get('/v1/digests',dependencies=[Depends(auth)])
     async def digests():
         pref=store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True})
         return {'account':store.get('google',{}).get('email',''),'scheduleLabel':'每天 '+pref['time'],'digests':store.get('digests',[])}
+    class TranslationRequest(BaseModel):
+        digestId:str=Field(max_length=200)
+        target:str=Field(max_length=10)
+    @app.post('/v1/translate',dependencies=[Depends(auth)])
+    async def translate(value:TranslationRequest):
+        async with lock:
+            digest=next((d for d in store.get('digests',[]) if d['id']==value.digestId),None)
+            if digest is None:raise HTTPException(404,'简报已不存在，请刷新。')
+            try:
+                return await asyncio.wait_for(translate_digest(store,digest,value.target,os.getenv('GOOGLE_TRANSLATE_API_KEY','').strip()),timeout=90)
+            except TimeoutError:
+                raise HTTPException(504,'翻译超时，原文已保留，请稍后重试。') from None
     @app.post('/v1/sync',dependencies=[Depends(auth)])
     async def manual_sync():return await sync()
     @app.post('/v1/oauth/google/start',dependencies=[Depends(auth)])
@@ -190,6 +203,6 @@ def create_app(settings=None, start_scheduler=True):
                         revoked=r.status_code in (200,400)
                 except Exception:revoked=False
             else:revoked=True
-            store.delete('google','digests','watermark','push','push_pending','push_status','oauth','schedule_done','last_error')
+            store.delete('translations','google','digests','watermark','push','push_pending','push_status','oauth','schedule_done','last_error')
         return {'disconnected':True,'googleRevocationConfirmed':revoked}
     return app
