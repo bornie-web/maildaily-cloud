@@ -7,4 +7,4 @@ RUN useradd --uid 10001 --create-home maildaily && mkdir /data && chown maildail
 USER maildaily
 ENV DATABASE_PATH=/data/maildaily.sqlite3
 EXPOSE 8000
-CMD ["uvicorn","run:app","--host","0.0.0.0","--port","8000","--workers","1","--no-access-log"]
+CMD ["sh","-c","uvicorn run:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --no-access-log"]

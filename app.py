@@ -9,11 +9,12 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from core import Store, digest_query, organize, attachment_parts, attachment_metadata
+from core import Store, digest_query, organize, attachment_parts, attachment_metadata, CATEGORIES, valid_category
 from translation import translate_digest
 load_dotenv()
 log=logging.getLogger('maildaily')
-SCOPES='https://www.googleapis.com/auth/gmail.readonly'
+SCOPES='https://www.googleapis.com/auth/gmail.modify'
+ACTION_LABELS={'archive':({'remove':['INBOX']}),'read':({'remove':['UNREAD']}),'unread':({'add':['UNREAD']}),'star':({'add':['STARRED']}),'unstar':({'remove':['STARRED']})}
 class Settings:
     def __init__(self):
         self.api_key=os.getenv('APP_API_KEY','');self.key=os.getenv('DATA_ENCRYPTION_KEY','')
@@ -84,7 +85,7 @@ def create_app(settings=None, start_scheduler=True):
         async with lock:
             end=int(time.time()*1000);start=store.get('watermark',end-24*3600*1000)
             try:
-                messages=await fetch_mail(start,end);digest=organize(messages,start,end)
+                messages=await fetch_mail(start,end);digest=organize(messages,start,end,store.get('rules',[]))
                 editions=store.get('digests',[])
                 values={'digests':[digest]+editions[:29],'watermark':end,'last_error':None}
                 if schedule_key:values['schedule_done']=schedule_key
@@ -130,7 +131,7 @@ def create_app(settings=None, start_scheduler=True):
     @app.get('/v1/state',dependencies=[Depends(auth)])
     async def state():
         g=store.get('google',{})
-        return {'connected':bool(g),'account':g.get('email'),'schedule':store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True}),'lastError':store.get('last_error'),'pushRegistered':bool(store.get('push')),'pushStatus':store.get('push_status','not_configured'),'translationAvailable':bool(os.getenv('GOOGLE_TRANSLATE_API_KEY','').strip()),'summaryMode':'规则归类与正文摘录'}
+        return {'connected':bool(g),'account':g.get('email'),'schedule':store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True}),'lastError':store.get('last_error'),'pushRegistered':bool(store.get('push')),'pushStatus':store.get('push_status','not_configured'),'translationAvailable':bool(os.getenv('GOOGLE_TRANSLATE_API_KEY','').strip()),'summaryMode':'规则归类与正文摘录','rules':store.get('rules',[]),'scope':SCOPES,'retention':'最多保存最近30期简报；可随时在 App 中清空云端历史或断开并删除全部数据。'}
     @app.get('/v1/digests',dependencies=[Depends(auth)])
     async def digests():
         pref=store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True})
@@ -189,6 +190,50 @@ def create_app(settings=None, start_scheduler=True):
         if len(raw)>limit:raise HTTPException(413,'附件超过10MB，请通过原邮件打开。')
         meta=next(a for a in attachment_metadata(message['payload'],mid) if a['partId']==part_id)
         return {**meta,'size':len(raw),'base64':base64.b64encode(raw).decode()}
+    class Rule(BaseModel):
+        kind:str=Field(pattern=r'^(domain|keyword)$')
+        value:str=Field(min_length=1,max_length=120)
+        category:str
+    @app.get('/v1/rules',dependencies=[Depends(auth)])
+    async def list_rules():return {'rules':store.get('rules',[])}
+    @app.post('/v1/rules',dependencies=[Depends(auth)])
+    async def add_rule(value:Rule):
+        if not valid_category(value.category):raise HTTPException(422,'分类不正确。')
+        rule=value.model_dump();rule['value']=rule['value'].strip()
+        if rule['kind']=='domain':
+            if not re.fullmatch(r'[a-z0-9.-]+\.[a-z]{2,}',rule['value'].lower()):raise HTTPException(422,'域名格式不正确。')
+            rule['value']=rule['value'].lower()
+        rules=store.get('rules',[])
+        if len(rules)>=100:raise HTTPException(422,'规则最多100条，请先删除不再需要的规则。')
+        if any(r['kind']==rule['kind'] and r['value'].lower()==rule['value'].lower() for r in rules):
+            raise HTTPException(409,'已存在相同规则。')
+        rules.append(rule);store.put('rules',rules);return {'rules':rules}
+    @app.delete('/v1/rules/{index}',dependencies=[Depends(auth)])
+    async def delete_rule(index:int):
+        rules=store.get('rules',[])
+        if not 0<=index<len(rules):raise HTTPException(404,'规则不存在。')
+        rules.pop(index);store.put('rules',rules);return {'rules':rules}
+    class MailAction(BaseModel):
+        ids:list[str]=Field(min_length=1,max_length=200)
+        action:str=Field(pattern=r'^(archive|read|unread|star|unstar)$')
+    @app.post('/v1/actions',dependencies=[Depends(auth)])
+    async def apply_action(value:MailAction):
+        for mid in value.ids:
+            if not re.fullmatch(r'[a-fA-F0-9]{1,100}',mid):raise HTTPException(422,'邮件标识不正确。')
+        known={mid for d in store.get('digests',[]) for item in d['items'] for link in item['links'] for mid in [link.get('url','').rsplit('#all/',1)[-1]]}
+        unknown=[m for m in value.ids if m not in known]
+        if unknown:raise HTTPException(404,'部分邮件不在现有简报中，请刷新后重试。')
+        access=await token();ops=ACTION_LABELS[value.action]
+        body={'ids':value.ids,'addLabelIds':ops.get('add',[]),'removeLabelIds':ops.get('remove',[])}
+        async with httpx.AsyncClient(timeout=45,headers={'Authorization':'Bearer '+access}) as client:
+            r=await client.post('https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify',json=body)
+        if r.status_code==403:raise HTTPException(502,'Gmail 授权范围不足，请断开并重新连接 Gmail（需要修改权限才能执行归档等操作）。')
+        if r.status_code!=200:raise HTTPException(502,'Gmail 操作未完成，请稍后重试。原邮件未改变。')
+        return {'applied':value.action,'count':len(value.ids)}
+    @app.delete('/v1/digests',dependencies=[Depends(auth)])
+    async def clear_digests():
+        store.delete('digests','translations','watermark','schedule_done','last_error')
+        return {'cleared':True}
     @app.post('/v1/sync',dependencies=[Depends(auth)])
     async def manual_sync():return await sync()
     @app.post('/v1/oauth/google/start',dependencies=[Depends(auth)])
@@ -245,6 +290,6 @@ def create_app(settings=None, start_scheduler=True):
                         revoked=r.status_code in (200,400)
                 except Exception:revoked=False
             else:revoked=True
-            store.delete('translations','google','digests','watermark','push','push_pending','push_status','oauth','schedule_done','last_error')
+            store.delete('translations','google','digests','watermark','push','push_pending','push_status','oauth','schedule_done','last_error','rules')
         return {'disconnected':True,'googleRevocationConfirmed':revoked}
     return app
