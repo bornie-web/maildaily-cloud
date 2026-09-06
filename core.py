@@ -74,6 +74,27 @@ def classify(subject,text,labels):
     if re.search(r'安全提醒|异地登录|授权|security alert|new sign.in|verify your identity|需要回复|请.{0,24}回复|截止|deadline|action required|please reply',value):return '需关注'
     if re.search(r'订阅|续[费期]|收据|账单|扣款|发票|subscription|renewal|receipt|invoice|payment',value):return '账单订阅'
     return '一般通知'
+def attachment_parts(payload):
+    found=[]
+    def walk(part,path):
+        mime=part.get('mimeType','application/octet-stream').lower()
+        headers={h['name'].lower():h['value'] for h in part.get('headers',[])}
+        body=part.get('body',{})
+        if (part.get('filename') or mime.startswith('image/') or headers.get('content-disposition','').lower().startswith('attachment')) and (body.get('attachmentId') or 'data' in body):
+            found.append((path,part))
+        for i,child in enumerate(part.get('parts',[])):walk(child,path+'.'+str(i))
+    walk(payload,'0')
+    return found
+
+def attachment_metadata(payload,mid):
+    result=[]
+    for path,part in attachment_parts(payload):
+        mime=part.get('mimeType','application/octet-stream').lower()[:100]
+        result.append({'messageId':mid,'partId':path,'filename':part.get('filename','')[:240] or ('内嵌图片' if mime.startswith('image/') else '未命名附件'),
+            'mimeType':mime,'size':max(0,int(part.get('body',{}).get('size',0))),
+            'inline':not bool(part.get('filename'))})
+    return result
+
 def organize(messages,start_ms,end_ms):
     items=[];ads=[];seen=set()
     for msg in sorted(messages,key=lambda x:int(x['internalDate']),reverse=True):
@@ -92,10 +113,10 @@ def organize(messages,start_ms,end_ms):
         if is_code:excerpt='这是一封验证类通知，验证码不保存在简报中，请查看原邮件。'
         else:excerpt=content[:360] + ('…' if len(content)>360 else '')
         action={'需关注':'规则识别为需关注，请打开原邮件核对是否需要处理。','账单订阅':'金额与续期信息以原邮件和服务方账户页面为准。','一般通知':''}[category]
-        item={'id':mid,'category':category,'title':title,'summary':excerpt or '邮件没有可读取的正文，请查看原邮件。','action':action,'dateLabel':datetime.fromtimestamp(ts/1000,ZoneInfo('Asia/Shanghai')).strftime('%m/%d'),'count':1,'links':[link]}
+        item={'id':mid,'category':category,'title':title,'summary':excerpt or '邮件没有可读取的正文，请查看原邮件。','action':action,'dateLabel':datetime.fromtimestamp(ts/1000,ZoneInfo('Asia/Shanghai')).strftime('%m/%d'),'count':1,'links':[link],'attachments':attachment_metadata(msg.get('payload',{}),mid)}
         if 'CATEGORY_PROMOTIONS' in msg.get('labelIds',[]) and category=='一般通知':ads.append(item)
         else:items.append(item)
-    if ads:items.append({'id':'promotions','category':'一般通知','title':f'{len(ads)} 封普通推广','summary':'按邮件标签合并推广；请按需查看原邮件。','action':'','dateLabel':'本期','count':len(ads),'links':[x['links'][0] for x in ads]})
+    if ads:items.append({'id':'promotions','category':'一般通知','title':f'{len(ads)} 封普通推广','summary':'按邮件标签合并推广；请按需查看原邮件。','action':'','dateLabel':'本期','count':len(ads),'links':[x['links'][0] for x in ads],'attachments':[a for x in ads for a in x['attachments']]})
     order={'需关注':0,'账单订阅':1,'一般通知':2};items.sort(key=lambda x:order[x['category']])
     count=sum(x['count'] for x in items);important=sum(x['count'] for x in items if x['category']=='需关注')
     return {'id':str(end_ms),'generatedAt':iso(end_ms),'rangeStart':iso(start_ms),'rangeEnd':iso(end_ms),'total':count,'headline':f'本期 {count} 封邮件，{important} 封需关注。规则归类，正文摘录。' if count else '本期没有新邮件。','items':items}

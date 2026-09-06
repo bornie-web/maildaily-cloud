@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from core import Store, digest_query, organize
+from core import Store, digest_query, organize, attachment_parts, attachment_metadata
 from translation import translate_digest
 load_dotenv()
 log=logging.getLogger('maildaily')
@@ -147,6 +147,48 @@ def create_app(settings=None, start_scheduler=True):
                 return await asyncio.wait_for(translate_digest(store,digest,value.target,os.getenv('GOOGLE_TRANSLATE_API_KEY','').strip()),timeout=90)
             except TimeoutError:
                 raise HTTPException(504,'翻译超时，原文已保留，请稍后重试。') from None
+    async def read_attachment_message(mid):
+        if not re.fullmatch(r'[a-fA-F0-9]{1,100}',mid):raise HTTPException(422,'邮件标识不正确。')
+        known=any(link.get('url','').endswith('#all/'+mid) for d in store.get('digests',[]) for item in d['items'] for link in item['links'])
+        if not known:raise HTTPException(404,'该邮件不在现有简报中，请刷新或打开原邮件。')
+        access=await token()
+        async with httpx.AsyncClient(timeout=45,headers={'Authorization':'Bearer '+access}) as client:
+            r=await client.get(f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}',params={'format':'full'})
+        if r.status_code==404:raise HTTPException(404,'原邮件已删除或不可访问。')
+        if r.status_code!=200:raise HTTPException(502,'读取附件信息失败，请稍后重试。')
+        return r.json(),access
+    @app.get('/v1/messages/{mid}/attachments',dependencies=[Depends(auth)])
+    async def list_attachments(mid:str):
+        message,_=await read_attachment_message(mid)
+        return attachment_metadata(message.get('payload',{}),mid)
+    @app.get('/v1/messages/{mid}/attachments/{part_id}',dependencies=[Depends(auth)])
+    async def download_attachment(mid:str,part_id:str):
+        if not re.fullmatch(r'0(?:\.[0-9]+)*',part_id) or len(part_id)>200:raise HTTPException(422,'附件标识不正确。')
+        message,access=await read_attachment_message(mid)
+        part=next((part for path,part in attachment_parts(message.get('payload',{})) if path==part_id),None)
+        if part is None:raise HTTPException(404,'附件不存在。')
+        body=part.get('body',{});limit=10*1024*1024
+        if int(body.get('size',0))>limit:raise HTTPException(413,'附件超过10MB，请通过原邮件打开。')
+        encoded=body.get('data','')
+        if body.get('attachmentId'):
+            aid=body['attachmentId']
+            if not re.fullmatch(r'[A-Za-z0-9_-]+',aid):raise HTTPException(502,'附件标识无效。')
+            async with httpx.AsyncClient(timeout=45,headers={'Authorization':'Bearer '+access}) as client:
+                async with client.stream('GET',f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}/attachments/{aid}') as response:
+                    if response.status_code!=200:raise HTTPException(502,'附件下载失败，请稍后重试。')
+                    chunks=[];size=0
+                    async for chunk in response.aiter_bytes():
+                        size+=len(chunk)
+                        if size>limit*4//3+10000:raise HTTPException(413,'附件超过10MB，请通过原邮件打开。')
+                        chunks.append(chunk)
+                    try:encoded=json.loads(b''.join(chunks))['data']
+                    except (ValueError,KeyError):raise HTTPException(502,'附件数据无效。') from None
+        if len(encoded)>limit*4//3+4:raise HTTPException(413,'附件超过10MB，请通过原邮件打开。')
+        try:raw=base64.b64decode(encoded+'='*(-len(encoded)%4),altchars=b'-_',validate=True)
+        except ValueError:raise HTTPException(502,'附件编码无效。') from None
+        if len(raw)>limit:raise HTTPException(413,'附件超过10MB，请通过原邮件打开。')
+        meta=next(a for a in attachment_metadata(message['payload'],mid) if a['partId']==part_id)
+        return {**meta,'size':len(raw),'base64':base64.b64encode(raw).decode()}
     @app.post('/v1/sync',dependencies=[Depends(auth)])
     async def manual_sync():return await sync()
     @app.post('/v1/oauth/google/start',dependencies=[Depends(auth)])
