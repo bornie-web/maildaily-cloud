@@ -60,6 +60,7 @@ def clean_text(value):
     value=html.unescape(value)
     value=LITERAL_COMMENT_RE.sub(' ',value)
     value=re.sub(r'<\s*>','',value)
+    value=re.sub(r'<([A-Za-z][A-Za-z0-9 .-]{0,40})>',r'\1',value)
     value=ZW_RE.sub('',value)
     value=URL_RE.sub(' ',value)
     value=TOKEN_RE.sub(' ',value)
