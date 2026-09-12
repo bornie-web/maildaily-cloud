@@ -7,10 +7,13 @@ from zoneinfo import ZoneInfo
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from pydantic import BaseModel, Field
 from core import Store, digest_query, organize, attachment_parts, attachment_metadata, CATEGORIES, valid_category
 from translation import translate_digest
+from netease import register_netease
 load_dotenv()
 log=logging.getLogger('maildaily')
 SCOPES='https://www.googleapis.com/auth/gmail.modify'
@@ -109,6 +112,9 @@ def create_app(settings=None, start_scheduler=True):
                     await sync(key)
                 await send_pending()
             except Exception:log.warning('Scheduled work could not complete; see authenticated state endpoint.')
+            try:
+                await netease_tick()
+            except Exception:log.warning('163 scheduled work could not complete; see authenticated state endpoint.')
             await asyncio.sleep(30)
     @asynccontextmanager
     async def lifespan(app):
@@ -119,6 +125,13 @@ def create_app(settings=None, start_scheduler=True):
             with suppress(asyncio.CancelledError):await task
     app=FastAPI(title='MailDaily independent cloud',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
     app.state.store=store
+    netease_tick=register_netease(app,store,auth)
+    app.state.netease_tick=netease_tick
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, exc):
+        if request.url.path.startswith('/v1/netease/'):
+            return JSONResponse(status_code=422,content={'detail':'163请求格式不正确，请核对输入。'})
+        return await request_validation_exception_handler(request,exc)
     @app.middleware('http')
     async def security(request,call_next):
         response=await call_next(request)
