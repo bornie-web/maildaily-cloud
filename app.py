@@ -13,6 +13,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from pydantic import BaseModel, Field
 from core import Store, digest_query, organize, attachment_parts, attachment_metadata, CATEGORIES, valid_category
 from translation import translate_digest, translation_provider
+from aisummary import ai_summary_config, apply_ai_summary
 from netease import register_netease
 load_dotenv()
 log=logging.getLogger('maildaily')
@@ -89,6 +90,9 @@ def create_app(settings=None, start_scheduler=True):
             end=int(time.time()*1000);start=store.get('watermark',end-24*3600*1000)
             try:
                 messages=await fetch_mail(start,end);digest=organize(messages,start,end,store.get('rules',[]))
+                try:
+                    if await apply_ai_summary(digest,ai_summary_config(os.getenv)):digest['headline']=f"本期 {digest['total']} 封邮件，AI 一句话摘要（DeepSeek），分类仍为规则判定。"
+                except Exception:log.warning('AI summary skipped; rule excerpts kept.')
                 editions=store.get('digests',[])
                 values={'digests':[digest]+editions[:29],'watermark':end,'last_error':None}
                 if schedule_key:values['schedule_done']=schedule_key
@@ -144,7 +148,7 @@ def create_app(settings=None, start_scheduler=True):
     @app.get('/v1/state',dependencies=[Depends(auth)])
     async def state():
         g=store.get('google',{})
-        return {'connected':bool(g),'account':g.get('email'),'schedule':store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True}),'lastError':store.get('last_error'),'pushRegistered':bool(store.get('push')),'pushStatus':store.get('push_status','not_configured'),'translationAvailable':bool(translation_provider(os.getenv)),'summaryMode':'规则归类与正文摘录','rules':store.get('rules',[]),'scope':SCOPES,'retention':'最多保存最近30期简报；可随时在 App 中清空云端历史或断开并删除全部数据。'}
+        return {'connected':bool(g),'account':g.get('email'),'schedule':store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True}),'lastError':store.get('last_error'),'pushRegistered':bool(store.get('push')),'pushStatus':store.get('push_status','not_configured'),'translationAvailable':bool(translation_provider(os.getenv)),'summaryMode':'AI 一句话摘要（DeepSeek）+ 规则归类' if ai_summary_config(os.getenv) else '规则归类与正文摘录','rules':store.get('rules',[]),'scope':SCOPES,'retention':'最多保存最近30期简报；可随时在 App 中清空云端历史或断开并删除全部数据。'}
     @app.get('/v1/digests',dependencies=[Depends(auth)])
     async def digests():
         pref=store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True})

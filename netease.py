@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, Field, SecretStr
 from core import organize, attachment_metadata, attachment_parts
+from aisummary import ai_summary_config, apply_ai_summary
 
 MAX_MESSAGE = 20 * 1024 * 1024
 MAX_BATCH = 50 * 1024 * 1024
@@ -203,6 +204,11 @@ def register_netease(app, store, auth):
             try:
                 messages = await asyncio.to_thread(fetch_mail, saved, start, end)
                 digest = organize(messages, start, end)
+                try:
+                    import os
+                    await apply_ai_summary(digest, ai_summary_config(os.getenv))
+                except Exception:
+                    pass
                 for item in digest['items']:
                     item['links'] = [{'label': item['title'], 'url': 'https://mail.163.com/'}]
                     item['unsubscribe'] = None
