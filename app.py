@@ -213,6 +213,26 @@ def create_app(settings=None, start_scheduler=True):
         rules=store.get('rules',[])
         if not 0<=index<len(rules):raise HTTPException(404,'规则不存在。')
         rules.pop(index);store.put('rules',rules);return {'rules':rules}
+    class Correction(BaseModel):
+        digestId:str
+        itemId:str
+        category:str
+    @app.put('/v1/classification',dependencies=[Depends(auth)])
+    async def correct_item(value:Correction):
+        if not valid_category(value.category):raise HTTPException(422,'分类不正确。')
+        async with lock:
+            digests=store.get('digests',[])
+            for digest in digests:
+                if digest['id']!=value.digestId:continue
+                for item in digest['items']:
+                    if item['id']!=value.itemId:continue
+                    item['category']=value.category
+                    item['action']='分类已由你调整，请结合原邮件决定是否处理。'
+                    item['reason']='你已手动纠正本条分类；不会影响未来邮件。'
+                    digest['headline']='本期分类已更新，请查看下方邮件。'
+                    store.put('digests',digests);store.delete('translations')
+                    return {'updated':True}
+            raise HTTPException(404,'邮件已不在简报中，请刷新。')
     class MailAction(BaseModel):
         ids:list[str]=Field(min_length=1,max_length=200)
         action:str=Field(pattern=r'^(archive|read|unread|star|unstar)$')
@@ -224,12 +244,12 @@ def create_app(settings=None, start_scheduler=True):
         unknown=[m for m in value.ids if m not in known]
         if unknown:raise HTTPException(404,'部分邮件不在现有简报中，请刷新后重试。')
         access=await token();ops=ACTION_LABELS[value.action]
-        body={'ids':value.ids,'addLabelIds':ops.get('add',[]),'removeLabelIds':ops.get('remove',[])}
+        body={'ids':list(dict.fromkeys(value.ids)),'addLabelIds':ops.get('add',[]),'removeLabelIds':ops.get('remove',[])}
         async with httpx.AsyncClient(timeout=45,headers={'Authorization':'Bearer '+access}) as client:
             r=await client.post('https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify',json=body)
         if r.status_code==403:raise HTTPException(502,'Gmail 授权范围不足，请断开并重新连接 Gmail（需要修改权限才能执行归档等操作）。')
-        if r.status_code!=200:raise HTTPException(502,'Gmail 操作未完成，请稍后重试。原邮件未改变。')
-        return {'applied':value.action,'count':len(value.ids)}
+        if r.status_code not in (200,204):raise HTTPException(502,'无法确认 Gmail 操作结果，请到原邮箱核对后重试。')
+        return {'applied':value.action,'count':len(set(value.ids))}
     @app.delete('/v1/digests',dependencies=[Depends(auth)])
     async def clear_digests():
         store.delete('digests','translations','watermark','schedule_done','last_error')
