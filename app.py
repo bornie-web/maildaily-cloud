@@ -12,7 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
 from pydantic import BaseModel, Field
 from core import Store, digest_query, organize, attachment_parts, attachment_metadata, CATEGORIES, valid_category
-from translation import translate_digest
+from translation import translate_digest, translation_provider
 from netease import register_netease
 load_dotenv()
 log=logging.getLogger('maildaily')
@@ -144,7 +144,7 @@ def create_app(settings=None, start_scheduler=True):
     @app.get('/v1/state',dependencies=[Depends(auth)])
     async def state():
         g=store.get('google',{})
-        return {'connected':bool(g),'account':g.get('email'),'schedule':store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True}),'lastError':store.get('last_error'),'pushRegistered':bool(store.get('push')),'pushStatus':store.get('push_status','not_configured'),'translationAvailable':bool(os.getenv('GOOGLE_TRANSLATE_API_KEY','').strip()),'summaryMode':'规则归类与正文摘录','rules':store.get('rules',[]),'scope':SCOPES,'retention':'最多保存最近30期简报；可随时在 App 中清空云端历史或断开并删除全部数据。'}
+        return {'connected':bool(g),'account':g.get('email'),'schedule':store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True}),'lastError':store.get('last_error'),'pushRegistered':bool(store.get('push')),'pushStatus':store.get('push_status','not_configured'),'translationAvailable':bool(translation_provider(os.getenv)),'summaryMode':'规则归类与正文摘录','rules':store.get('rules',[]),'scope':SCOPES,'retention':'最多保存最近30期简报；可随时在 App 中清空云端历史或断开并删除全部数据。'}
     @app.get('/v1/digests',dependencies=[Depends(auth)])
     async def digests():
         pref=store.get('schedule',{'time':'19:00','timezone':'Asia/Shanghai','enabled':True})
@@ -158,7 +158,7 @@ def create_app(settings=None, start_scheduler=True):
             digest=next((d for d in store.get('digests',[]) if d['id']==value.digestId),None)
             if digest is None:raise HTTPException(404,'简报已不存在，请刷新。')
             try:
-                return await asyncio.wait_for(translate_digest(store,digest,value.target,os.getenv('GOOGLE_TRANSLATE_API_KEY','').strip()),timeout=90)
+                return await asyncio.wait_for(translate_digest(store,digest,value.target,translation_provider(os.getenv)),timeout=90)
             except TimeoutError:
                 raise HTTPException(504,'翻译超时，原文已保留，请稍后重试。') from None
     async def read_attachment_message(mid):
