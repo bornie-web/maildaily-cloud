@@ -7,14 +7,11 @@ from zoneinfo import ZoneInfo
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.exceptions import RequestValidationError
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from core import Store, digest_query, organize, attachment_parts, attachment_metadata, CATEGORIES, valid_category
 from translation import translate_digest, translation_provider
 from aisummary import ai_summary_config, apply_ai_summary
-from imapmail import PROVIDERS as IMAP_PROVIDERS, register_imap_providers
 load_dotenv()
 log=logging.getLogger('maildaily')
 SCOPES='https://www.googleapis.com/auth/gmail.modify'
@@ -116,10 +113,6 @@ def create_app(settings=None, start_scheduler=True):
                     await sync(key)
                 await send_pending()
             except Exception:log.warning('Scheduled work could not complete; see authenticated state endpoint.')
-            for pid,tick in imap_ticks.items():
-                try:
-                    await tick()
-                except Exception:log.warning('%s scheduled work could not complete; see authenticated state endpoint.',pid)
             await asyncio.sleep(30)
     @asynccontextmanager
     async def lifespan(app):
@@ -130,15 +123,6 @@ def create_app(settings=None, start_scheduler=True):
             with suppress(asyncio.CancelledError):await task
     app=FastAPI(title='MailDaily independent cloud',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
     app.state.store=store
-    imap_ticks=register_imap_providers(app,store,auth)
-    app.state.imap_ticks=imap_ticks
-    app.state.netease_tick=imap_ticks['netease']
-    @app.exception_handler(RequestValidationError)
-    async def validation_error(request, exc):
-        pid=next((p for p in IMAP_PROVIDERS if request.url.path.startswith(f'/v1/{p}/')),None)
-        if pid:
-            return JSONResponse(status_code=422,content={'detail':f"{IMAP_PROVIDERS[pid]['name']}请求格式不正确，请核对输入。"})
-        return await request_validation_exception_handler(request,exc)
     @app.middleware('http')
     async def security(request,call_next):
         response=await call_next(request)
